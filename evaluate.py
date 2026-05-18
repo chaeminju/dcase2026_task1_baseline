@@ -107,8 +107,8 @@ def evaluate_model(model_class, model_path, data_loader, device, class_to_topcla
             labels = data['class_idx'].to(device)
             sound_ids = data['sound_id']
 
-            audio_emb = data.get('audio_embedding', None)
-            text_emb = data.get('text_embedding', None)
+            audio_emb = data.get('audio_embedding_1', None)
+            text_emb = data.get('text_embedding_1', None)
 
             if audio_emb is not None:
                 audio_emb = audio_emb.to(device)

@@ -10,7 +10,10 @@ import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
 
-from losses import CrossEntropyLoss
+from losses import (
+    CrossEntropyLoss,
+    HierarchicalContrastiveLoss
+)
 from utils import get_subconfig, set_seed, build_class_to_topclass_mapping, build_class_to_topclass_tensor
 from models import BaseClassifier
 from dataset_utils import HATRDataset
@@ -57,7 +60,7 @@ def make_serializable(obj, decimals=6):
         return obj
     
 def train_model(model, train_loader, val_loader, device,
-                num_epochs=100, lr=0.001, classification_weight=1.0, classification_criterion=None, 
+                num_epochs=100, lr=0.001, classification_weight=1.0, classification_criterion=None, contrastive_criterion=None,
                 output_dir='model_output', scheduler_type='plateau', patience=10, early_stopping_factor=5):
     """
     Train a model with validation, LR scheduling, checkpointing, and early stopping.
@@ -93,17 +96,35 @@ def train_model(model, train_loader, val_loader, device,
 
         for data in train_loader:
             class_labels = data['class_idx'].to(device)
-            audio_emb = data.get('audio_embedding', None)
-            text_emb = data.get('text_embedding', None)
+            audio_emb_1 = data['audio_embedding_1'].to(device)
+            audio_emb_2 = data['audio_embedding_2'].to(device)
+
+            text_emb_1 = data['text_embedding_1'].to(device)
+            text_emb_2 = data['text_embedding_2'].to(device)
+
+            top_labels = data['top_class_idx'].to(device)
+            sub_labels = data['class_idx'].to(device)
             
-            if audio_emb is not None:
-                audio_emb = audio_emb.to(device)
-            if text_emb is not None:
-                text_emb = text_emb.to(device)
+            if audio_emb_1 is not None:
+                audio_emb_1 = audio_emb_1.to(device)
+            if audio_emb_2 is not None:
+                audio_emb_2 = audio_emb_2.to(device)
+            if text_emb_1 is not None:
+                text_emb_1 = text_emb_1.to(device)
+            if text_emb_2 is not None:
+                text_emb_2 = text_emb_2.to(device)
 
             optimizer.zero_grad()
             
-            z, class_logit, attn_scores = model(audio_emb, text_emb)
+            z1, logits1, attn_scores = model(
+                audio_emb_1,
+                text_emb_1
+            )
+
+            z2, _, _ = model(
+                audio_emb_2,
+                text_emb_2
+            )
             
             # collect batch attention once per batch
             if attn_scores is not None:
@@ -116,10 +137,14 @@ def train_model(model, train_loader, val_loader, device,
             total_samples += batch_size
 
             if classification_criterion is not None:
-                cls_loss = classification_criterion(class_logit, class_labels)
+                cls_loss = classification_criterion(logits1, sub_labels)
                 losses['cls'] += cls_loss.item() * batch_size
                 total_loss += classification_weight * cls_loss
-
+            if contrastive_criterion is not None:
+                cont_loss = contrastive_criterion(z1, z2, sub_labels, top_labels)
+                losses['contrastive'] += cont_loss.item() * batch_size
+                total_loss += cont_loss
+                
             total_loss.backward()
             optimizer.step()
             losses['total'] += total_loss.item() * batch_size
@@ -142,8 +167,8 @@ def train_model(model, train_loader, val_loader, device,
         with torch.no_grad():
             for data in val_loader:
                 labels = data['class_idx'].to(device)
-                audio_emb = data.get('audio_embedding', None)
-                text_emb = data.get('text_embedding', None)
+                audio_emb = data['audio_embedding_1'].to(device)
+                text_emb = data['text_embedding_1'].to(device)
                 
                 if audio_emb is not None:
                     audio_emb = audio_emb.to(device)
@@ -299,6 +324,7 @@ if __name__ == "__main__":
                 ).to(device)
 
                 classification_criterion = CrossEntropyLoss()
+                contrastive_criterion = HierarchicalContrastiveLoss()
 
                 output_dir = os.path.join(
                     model_output,
@@ -315,6 +341,7 @@ if __name__ == "__main__":
                     num_epochs=num_epochs, lr=learning_rate,
                     classification_weight=classification_weight,
                     classification_criterion=classification_criterion,
+                    contrastive_criterion=contrastive_criterion,
                     output_dir=output_dir,
                     scheduler_type=scheduler_type, patience=patience, early_stopping_factor=early_stopping_factor
                 )

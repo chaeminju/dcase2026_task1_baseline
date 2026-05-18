@@ -192,14 +192,15 @@ class BaseClassifier(nn.Module):
             combined_features = features[0]
             attn_scores = None
         
-        z = self.latent_projector(combined_features)
-        
+        proj_z = self.latent_projector(combined_features)
+
+        z = proj_z
         for block in self.residual_classifier:
             z = block(z)
         
         class_logit = self.class_predictor(z)
         
-        return z, class_logit, attn_scores
+        return proj_z, class_logit, attn_scores
 
 
 if __name__ == "__main__":

@@ -45,16 +45,31 @@ class HATRDataset(Dataset):
         text_path = sample['text_emb_filepath']
         text_emb = torch.tensor(np.load(text_path), dtype=torch.float32)
 
+        emb1 = emb.clone()
+        emb2 = emb.clone()
+
+        text1 = text_emb.clone()
+        text2 = text_emb.clone()
+
         if self.aug:
-            emb = emb + torch.randn_like(emb) * 0.0001
-            emb = self._rand_mask(emb)
-            text_emb = text_emb + torch.randn_like(text_emb) * 0.0001
-            text_emb = self._rand_mask(text_emb)
+            emb1 = emb1 + torch.randn_like(emb1) * 0.0001
+            emb1 = self._rand_mask(emb1)
+
+            emb2 = emb2 + torch.randn_like(emb2) * 0.0001
+            emb2 = self._rand_mask(emb2)
+
+            text1 = text1 + torch.randn_like(text1) * 0.0001
+            text1 = self._rand_mask(text1)
+
+            text2 = text2 + torch.randn_like(text2) * 0.0001
+            text2 = self._rand_mask(text2)
 
         sample_data = {
             'sound_id': sound_id,
-            'audio_embedding': emb,
-            'text_embedding': text_emb,
+            'audio_embedding_1': emb1,
+            'audio_embedding_2': emb2,
+            'text_embedding_1': text1,
+            'text_embedding_2': text2,
             'class': class_name,
             'class_idx': class_idx,
             'top_class': top_class_name,

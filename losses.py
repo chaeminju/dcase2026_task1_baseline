@@ -79,6 +79,10 @@ class ContrastiveLoss(UnagiContrastiveLoss):
             self.a_spread = 0
             self.a_lc = 1
             self.use_labels = False
+        elif type == "l_spread":
+            print(f"Using {type} contrastive loss function")
+            self.a_spread = 1.0
+            self.a_lc = 1.0
 
     def forward(self, *args):
         inputs = args[:-1]

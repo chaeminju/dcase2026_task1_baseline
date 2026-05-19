@@ -141,7 +141,7 @@ def train_model(model, train_loader, val_loader, device,
                 losses['cls'] += cls_loss.item() * batch_size
                 total_loss += classification_weight * cls_loss
             if contrastive_criterion is not None:
-                cont_loss = contrastive_criterion(z1, z2, sub_labels, top_labels)
+                cont_loss = contrastive_criterion(z1, z2,  top_labels, sub_labels)
                 losses['contrastive'] += cont_loss.item() * batch_size
                 total_loss += cont_loss
                 

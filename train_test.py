@@ -9,8 +9,9 @@ from sklearn.model_selection import StratifiedShuffleSplit, StratifiedKFold
 import torch
 from torch.utils.data import DataLoader
 import torch.nn as nn
+import torch.nn.functional as F
 
-from losses import CrossEntropyLoss
+from losses import CrossEntropyLoss, HierarchicalProxyLoss
 from utils import get_subconfig, set_seed, build_class_to_topclass_mapping, build_class_to_topclass_tensor
 from models import BaseClassifier
 from dataset_utils import HATRDataset
@@ -58,20 +59,28 @@ def make_serializable(obj, decimals=6):
     
 def train_model(model, train_loader, val_loader, device,
                 num_epochs=100, lr=0.001, classification_weight=1.0, classification_criterion=None, 
-                output_dir='model_output', scheduler_type='plateau', patience=10, early_stopping_factor=5):
+                output_dir='model_output', scheduler_type='plateau', patience=10, early_stopping_factor=5,
+                parent_of_child=None, class_dict=None, top_class_dict=None):
     """
-    Train a model with validation, LR scheduling, checkpointing, and early stopping.
+    Train a model with Hierarchical Proxy Loss.
 
-    Tracks training loss, validation accuracy, and (if available) attention statistics.
-    Saves the best model with a config, and training history to `output_dir`.
-
-    Returns:
-        best_accuracy (float), history (dict), model (nn.Module)
+    Args:
+        parent_of_child: [num_children] tensor mapping child class index to parent class index
+        class_dict: Dictionary of class names to indices
+        top_class_dict: Dictionary of top-class names to indices
     """
     
     os.makedirs(output_dir, exist_ok=True)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    # If using HierarchicalProxyLoss, update optimizer to include criterion parameters
+    if isinstance(classification_criterion, HierarchicalProxyLoss):
+        optimizer = torch.optim.AdamW(
+            list(model.parameters()) + list(classification_criterion.parameters()),
+            lr=lr, weight_decay=1e-4
+        )
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    
     if scheduler_type == 'plateau':
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=patience, verbose=True)
     elif scheduler_type == 'step':
@@ -85,14 +94,19 @@ def train_model(model, train_loader, val_loader, device,
 
     for epoch in range(num_epochs):
         model.train()
+        if isinstance(classification_criterion, HierarchicalProxyLoss):
+            classification_criterion.train()
+        
         losses = defaultdict(float)
         total_samples = 0
+        total_child_correct = 0
+        total_parent_correct = 0
 
         attn_audio_epoch = []
         attn_text_epoch = []
 
         for data in train_loader:
-            class_labels = data['class_idx'].to(device)
+            child_labels = data['class_idx'].to(device)
             audio_emb = data.get('audio_embedding', None)
             text_emb = data.get('text_embedding', None)
             
@@ -103,7 +117,7 @@ def train_model(model, train_loader, val_loader, device,
 
             optimizer.zero_grad()
             
-            z, class_logit, attn_scores = model(audio_emb, text_emb)
+            z, _, attn_scores = model(audio_emb, text_emb)
             
             # collect batch attention once per batch
             if attn_scores is not None:
@@ -111,14 +125,47 @@ def train_model(model, train_loader, val_loader, device,
                 attn_text_epoch.append(attn_scores[:, 1].detach().cpu())
 
             total_loss = 0.0
-            
-            batch_size = class_labels.size(0)
+            batch_size = child_labels.size(0)
             total_samples += batch_size
 
             if classification_criterion is not None:
-                cls_loss = classification_criterion(class_logit, class_labels)
-                losses['cls'] += cls_loss.item() * batch_size
-                total_loss += classification_weight * cls_loss
+                if isinstance(classification_criterion, HierarchicalProxyLoss):
+                    # HierarchicalProxyLoss expects parent_of_child as tensor on device
+                    parent_of_child_device = parent_of_child.to(device)
+                    
+                    # Get parent labels from child labels (must index after moving to device)
+                    parent_labels = parent_of_child_device[child_labels]
+                    
+                    total_loss, loss_dict = classification_criterion(
+                        z=z,
+                        parent_labels=parent_labels,
+                        child_labels=child_labels,
+                        parent_of_child=parent_of_child_device
+                    )
+                    
+                    # Track individual losses
+                    for k, v in loss_dict.items():
+                        if k != 'total':
+                            losses[k] += v * batch_size
+                    
+                    # Calculate accuracy with proxy
+                    with torch.no_grad():
+                        parent_proxies = F.normalize(classification_criterion.parent_proxies, dim=1)
+                        child_proxies = F.normalize(classification_criterion.child_proxies, dim=1)
+                        
+                        child_logits = torch.matmul(z, child_proxies.T)
+                        parent_logits = torch.matmul(z, parent_proxies.T)
+                        
+                        child_pred = child_logits.argmax(dim=1)
+                        parent_pred = parent_logits.argmax(dim=1)
+                        
+                        total_child_correct += (child_pred == child_labels).sum().item()
+                        total_parent_correct += (parent_pred == parent_labels).sum().item()
+                else:
+                    # Standard CrossEntropyLoss
+                    cls_loss = classification_criterion(z, child_labels)
+                    losses['cls'] += cls_loss.item() * batch_size
+                    total_loss += classification_weight * cls_loss
 
             total_loss.backward()
             optimizer.step()
@@ -135,13 +182,23 @@ def train_model(model, train_loader, val_loader, device,
         for k in losses:
             history[f'train_{k}_loss'].append(losses[k] / total_samples)
         history['learning_rates'].append(optimizer.param_groups[0]['lr'])
+        
+        # Calculate train accuracy
+        train_child_acc = total_child_correct / total_samples if isinstance(classification_criterion, HierarchicalProxyLoss) else 0
+        history['train_child_acc'].append(train_child_acc)
+        if isinstance(classification_criterion, HierarchicalProxyLoss):
+            train_parent_acc = total_parent_correct / total_samples
+            history['train_parent_acc'].append(train_parent_acc)
 
         model.eval()
+        if isinstance(classification_criterion, HierarchicalProxyLoss):
+            classification_criterion.eval()
+        
         correct = 0
         total = 0
         with torch.no_grad():
             for data in val_loader:
-                labels = data['class_idx'].to(device)
+                child_labels = data['class_idx'].to(device)
                 audio_emb = data.get('audio_embedding', None)
                 text_emb = data.get('text_embedding', None)
                 
@@ -150,23 +207,31 @@ def train_model(model, train_loader, val_loader, device,
                 if text_emb is not None:
                     text_emb = text_emb.to(device)
 
-                _, class_logit, _ = model(audio_emb, text_emb)
+                z, _, _ = model(audio_emb, text_emb)
+                
+                if isinstance(classification_criterion, HierarchicalProxyLoss):
+                    # Use proxy for prediction
+                    parent_proxies = F.normalize(classification_criterion.parent_proxies, dim=1)
+                    child_proxies = F.normalize(classification_criterion.child_proxies, dim=1)
                     
-                _, predicted = torch.max(class_logit.data, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
+                    child_logits = torch.matmul(z, child_proxies.T)
+                    _, predicted = torch.max(child_logits.data, 1)
+                else:
+                    # Standard prediction (shouldn't reach here with HierarchicalProxyLoss)
+                    _, predicted = torch.max(z.data, 1)
+                
+                total += child_labels.size(0)
+                correct += (predicted == child_labels).sum().item()
 
-        val_accuracy = 100 * correct / total
+        val_accuracy = 100 * correct / total if total > 0 else 0
         history['val_accuracy'].append(val_accuracy)
 
         with open(os.path.join(output_dir, "history.json"), "w") as f:
             json.dump(make_serializable(history), f, indent=2)
 
         print(f"Epoch [{epoch + 1}/{num_epochs}] - Val acc: {val_accuracy:.2f}%")
-        # for k in losses:
-        #     if losses[k] > 0:
-        #         print(f"  {k.capitalize()} loss: {losses[k] / total_samples:.4f}")
-        # print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        if isinstance(classification_criterion, HierarchicalProxyLoss):
+            print(f"  Train child acc: {train_child_acc:.2f}%, parent acc: {train_parent_acc:.2f}%")
 
         if scheduler:
             if scheduler_type == 'plateau':
@@ -177,14 +242,22 @@ def train_model(model, train_loader, val_loader, device,
         if val_accuracy > best_accuracy:
             best_accuracy = val_accuracy
             model_config = {'hidden_size': hidden_size, 'num_classes': len(class_dict),
-                'emb_size_audio': emb_size_audio, 'emb_size_text': emb_size_text, 
+                'emb_size_audio': emb_size_audio, 'emb_size_text': emb_size_text,
                 'dropout': dropout, 'use_batch_norm': True,'mode': mode,
             }
 
-            torch.save({
+            checkpoint = {
                 'model_state': model.state_dict(),
                 'config': model_config,
-            }, os.path.join(output_dir, "best_model.pth"))
+                'use_hierarchical_loss': isinstance(classification_criterion, HierarchicalProxyLoss),
+            }
+            
+            # Save criterion (proxy parameters) if using HierarchicalProxyLoss
+            if isinstance(classification_criterion, HierarchicalProxyLoss):
+                checkpoint['criterion_state'] = classification_criterion.state_dict()
+                checkpoint['parent_of_child'] = parent_of_child.cpu().numpy()
+            
+            torch.save(checkpoint, os.path.join(output_dir, "best_model.pth"))
 
             print(f"  New best model saved")
             epochs_without_improvement = 0
@@ -298,7 +371,32 @@ if __name__ == "__main__":
                     mode=mode
                 ).to(device)
 
-                classification_criterion = CrossEntropyLoss()
+                # Build parent_of_child mapping for HierarchicalProxyLoss
+                parent_of_child_list = []
+                for child_idx in range(len(class_dict)):
+                    # Find class name from index
+                    class_name = [k for k, v in class_dict.items() if v == child_idx][0]
+                    # Get top-class name from class name
+                    top_class_name = class_name.split('-')[0]
+                    # Get parent index
+                    parent_idx = top_class_dict.get(top_class_name, 0)
+                    parent_of_child_list.append(parent_idx)
+                
+                parent_of_child = torch.tensor(parent_of_child_list, dtype=torch.long)
+                
+                # Use HierarchicalProxyLoss instead of CrossEntropyLoss
+                classification_criterion = HierarchicalProxyLoss(
+                    embedding_dim=hidden_size // 2,  # Must match latent dimension
+                    num_parents=len(top_class_dict),
+                    num_children=len(class_dict),
+                    temperature=0.07,
+                    alpha=0.4,
+                    beta=0.3,
+                    gamma=0.15,
+                    delta=0.05,
+                    sibling_margin=0.4,
+                    parent_margin=0.0,
+                ).to(device)
 
                 output_dir = os.path.join(
                     model_output,
@@ -316,7 +414,10 @@ if __name__ == "__main__":
                     classification_weight=classification_weight,
                     classification_criterion=classification_criterion,
                     output_dir=output_dir,
-                    scheduler_type=scheduler_type, patience=patience, early_stopping_factor=early_stopping_factor
+                    scheduler_type=scheduler_type, patience=patience, early_stopping_factor=early_stopping_factor,
+                    parent_of_child=parent_of_child,
+                    class_dict=class_dict,
+                    top_class_dict=top_class_dict
                 )
                 print(f"Best validation accuracy: {best_accuracy:.2f}%")
 
@@ -361,6 +462,7 @@ if __name__ == "__main__":
                     output_dir=output_dir,
                     fold_id=fold,
                     class_dict=class_dict,
+                    top_class_dict=top_class_dict,
                 )
 
                 print("\n===== Fold Results =====")

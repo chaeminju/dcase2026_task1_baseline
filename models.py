@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ResidualBlock(nn.Module):
@@ -164,14 +165,9 @@ class BaseClassifier(nn.Module):
             for _ in range(2)
         ])
         
-        self.class_predictor = nn.Sequential(
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout / 4),
-            nn.Linear(hidden_size // 4, num_classes)
-        )
+        # Note: class_predictor removed - using proxy-based classification instead
     
-    def forward(self, audio_emb=None, text_emb=None):
+    def forward(self, audio_emb=None, text_emb=None, return_normalized=True):
         features = []
         
         if self.mode in ["audio", "both"]:
@@ -197,9 +193,11 @@ class BaseClassifier(nn.Module):
         for block in self.residual_classifier:
             z = block(z)
         
-        class_logit = self.class_predictor(z)
+        # L2 normalize for metric learning (for proxy-based classification)
+        if return_normalized:
+            z = F.normalize(z, dim=1)
         
-        return z, class_logit, attn_scores
+        return z, None, attn_scores
 
 
 if __name__ == "__main__":
@@ -209,7 +207,7 @@ if __name__ == "__main__":
         dropout=0.2, use_batch_norm=False, mode="both")
     audio = torch.randn(1, 512)  
     text = torch.randn(1, 512)  
-    z, class_logit, attn_scores = model(audio_emb=audio, text_emb=text)
+    z, _, attn_scores = model(audio_emb=audio, text_emb=text)
     print("Latent representation shape:", z.shape)
     print("Model parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
     print("Attention scores:", attn_scores)

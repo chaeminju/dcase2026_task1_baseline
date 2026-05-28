@@ -1,9 +1,11 @@
 import os
 import torch
+import torch.nn.functional as F
 import pandas as pd
 import numpy as np 
 
 from utils import build_class_to_topclass_mapping, build_id_to_class_mapping, extend_subcat, intersection, get_top_level
+from losses import HierarchicalProxyLoss
 
 
 def hierarchical_accuracy(subcat, predictions_gt, lambda_param=0.5):
@@ -88,9 +90,9 @@ def hierarchical_prf_weighted(subcat, predictions_gt, lambda_param=0.75):
   return classP, classR, classF
 
 def evaluate_model(model_class, model_path, data_loader, device, class_to_topclass, 
-               output_dir, fold_id, class_dict=None):
+               output_dir, fold_id, class_dict=None, top_class_dict=None):
     # -------------------- Setup --------------------
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     config = checkpoint["config"]
     model = model_class(**config)
     model.load_state_dict(checkpoint["model_state"])
@@ -98,6 +100,19 @@ def evaluate_model(model_class, model_path, data_loader, device, class_to_topcla
     model.eval()
 
     model_name = model.__class__.__name__
+
+    # Load criterion (proxy) if available
+    criterion = None
+    parent_of_child = None
+    if checkpoint.get("use_hierarchical_loss", False):
+        parent_of_child = torch.tensor(checkpoint["parent_of_child"], dtype=torch.long)
+        criterion = HierarchicalProxyLoss(
+            embedding_dim=config['hidden_size'] // 2,
+            num_parents=len(top_class_dict),
+            num_children=config['num_classes'],
+        ).to(device)
+        criterion.load_state_dict(checkpoint["criterion_state"])
+        criterion.eval()
 
     predictions = {"sound_id": [], "gt": [], "pred": [], "pred_score": []}
 
@@ -115,8 +130,18 @@ def evaluate_model(model_class, model_path, data_loader, device, class_to_topcla
             if text_emb is not None:
                 text_emb = text_emb.to(device)
 
-            _, class_logits, _ = model(audio_emb, text_emb)
-            probs = torch.softmax(class_logits, dim=1)
+            z, _, _ = model(audio_emb, text_emb)
+            
+            if criterion is not None:
+                # Use proxy-based prediction
+                parent_proxies = F.normalize(criterion.parent_proxies, dim=1)
+                child_proxies = F.normalize(criterion.child_proxies, dim=1)
+                
+                child_logits = torch.matmul(z, child_proxies.T)
+                probs = torch.softmax(child_logits, dim=1)
+            else:
+                # Shouldn't happen in normal case, but fallback to direct prediction
+                probs = torch.softmax(z, dim=1)
 
             # Top-1 prediction
             # Note: expand with topk if needed

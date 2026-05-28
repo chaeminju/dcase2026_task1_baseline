@@ -1,4 +1,0 @@
-**/__pycache__/
-model*
-data/*
-!data/bst_colours.json
